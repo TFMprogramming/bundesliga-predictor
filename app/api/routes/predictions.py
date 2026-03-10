@@ -13,6 +13,7 @@ from app.data.models import Match, Team
 from app.data.openligadb_client import OpenLigaDBClient
 from app.features.builder import compute_prediction_features
 from app.models.ensemble import load_ensemble
+from app.services.analysis import generate_all_analyses
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/predictions", tags=["predictions"])
@@ -87,19 +88,48 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
     teams_by_id = {t.team_id: t for t in teams_result.scalars().all()}
     teams_by_name = {t.team_name: t for t in teams_by_id.values()}
 
-    predictions = []
+    # Build predictions + collect data for parallel analysis generation
+    match_results = []
     for raw in raw_matches:
         home_name = raw["homeTeamName"]
         away_name = raw["awayTeamName"]
         match_dt = raw["matchDatetime"]
 
-        # Compute features
         features = compute_prediction_features(home_name, away_name, all_matches, match_dt)
-
-        # Get prediction from ensemble
         result = ensemble.predict(home_name, away_name, features)
 
-        # Build team summaries (prefer DB data for icons)
+        match_results.append({
+            "raw": raw,
+            "home_name": home_name,
+            "away_name": away_name,
+            "match_dt": match_dt,
+            "features": features,
+            "result": result,
+        })
+
+    # Generate AI analyses in parallel for all matches
+    analyses_input = [
+        {
+            "match_id": m["raw"]["matchId"],
+            "home_team": m["home_name"],
+            "away_team": m["away_name"],
+            "prediction": m["result"],
+            "features": m["features"],
+            "dc_alpha": ensemble.dc.alpha,
+            "dc_beta": ensemble.dc.beta,
+        }
+        for m in match_results
+    ]
+    analyses = await generate_all_analyses(analyses_input, matchday)
+
+    # Assemble final predictions
+    predictions = []
+    for m in match_results:
+        raw = m["raw"]
+        home_name = m["home_name"]
+        away_name = m["away_name"]
+        result = m["result"]
+
         home_team = teams_by_name.get(home_name)
         away_team = teams_by_name.get(away_name)
 
@@ -123,7 +153,7 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
         predictions.append(
             MatchPrediction(
                 matchId=raw["matchId"],
-                matchDateTime=match_dt,
+                matchDateTime=m["match_dt"],
                 homeTeam=home_summary,
                 awayTeam=away_summary,
                 probabilities=Probabilities(**p),
@@ -134,6 +164,7 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
                 modelAgreement=result["modelAgreement"],
                 dcProbabilities=Probabilities(**dc_p),
                 xgbProbabilities=Probabilities(**xgb_p),
+                analysisText=analyses.get(raw["matchId"]) or None,
             )
         )
 

@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     CURRENT_SEASON: int = 2025
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./bundesliga.db"
+    ANTHROPIC_API_KEY: str = ""
 
     # Dixon-Coles time decay (half-life ~115 days)
     DC_XI: float = 0.006

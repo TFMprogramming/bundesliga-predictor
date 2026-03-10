@@ -40,6 +40,7 @@ class MatchPrediction(BaseModel):
     modelAgreement: bool
     dcProbabilities: Probabilities
     xgbProbabilities: Probabilities
+    analysisText: str | None = None
 
 
 class NextMatchdayResponse(BaseModel):
