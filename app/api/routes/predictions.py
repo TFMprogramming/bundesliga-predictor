@@ -120,7 +120,7 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
         }
         for m in match_results
     ]
-    analyses = await generate_all_analyses(analyses_input, matchday)
+    analyses = await generate_all_analyses(analyses_input, matchday, session)
 
     # Assemble final predictions
     predictions = []

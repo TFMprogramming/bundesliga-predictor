@@ -61,6 +61,16 @@ class Goal(Base):
     is_overtime: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class MatchAnalysis(Base):
+    """Cached AI-generated analysis texts per match."""
+    __tablename__ = "match_analyses"
+
+    match_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    matchday: Mapped[int] = mapped_column(Integer, nullable=False)
+    analysis_text: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ModelArtifact(Base):
     __tablename__ = "model_artifacts"
 
