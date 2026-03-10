@@ -10,8 +10,8 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./bundesliga.db"
 
-    # Dixon-Coles time decay (half-life ~230 days)
-    DC_XI: float = 0.003
+    # Dixon-Coles time decay (half-life ~115 days)
+    DC_XI: float = 0.006
     # Minimum matches per team before trusting parameters
     MIN_MATCHES: int = 5
 

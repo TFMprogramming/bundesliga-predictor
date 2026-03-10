@@ -13,8 +13,13 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 FORM_WINDOW = 5      # last N matches for form
+FORM_SHORT = 3       # last N matches for momentum
 FORM_LONG = 10       # last N matches for long-term form
 H2H_WINDOW = 8       # last N head-to-head meetings
+
+ELO_K = 20.0               # Elo K-factor
+ELO_HOME_ADVANTAGE = 80.0  # Elo home advantage in rating points
+ELO_DEFAULT = 1500.0       # Starting Elo for new teams
 
 
 def build_feature_matrix(matches: list[dict]) -> pd.DataFrame:
@@ -30,15 +35,24 @@ def build_feature_matrix(matches: list[dict]) -> pd.DataFrame:
     df["match_datetime"] = pd.to_datetime(df["match_datetime"])
     df = df.sort_values("match_datetime").reset_index(drop=True)
 
+    # Pre-compute Elo ratings (Elo BEFORE each match, no leakage)
+    elo_before = _compute_elo_ratings(df)
+
     records = []
     for idx, row in df.iterrows():
         prior = df.iloc[:idx]  # Only matches BEFORE this one
-        features = _compute_features(row, prior)
+        h_elo = elo_before.get(row["home_team"], ELO_DEFAULT)
+        a_elo = elo_before.get(row["away_team"], ELO_DEFAULT)
+        features = _compute_features(row, prior, h_elo=h_elo, a_elo=a_elo)
         features["match_id"] = row["match_id"]
         features["home_goals"] = int(row["home_goals"])
         features["away_goals"] = int(row["away_goals"])
         features["outcome"] = _outcome(row["home_goals"], row["away_goals"])
         records.append(features)
+
+        # Update Elo after this match
+        _update_elo(elo_before, row["home_team"], row["away_team"],
+                    int(row["home_goals"]), int(row["away_goals"]))
 
     return pd.DataFrame(records)
 
@@ -58,6 +72,15 @@ def compute_prediction_features(
     df["match_datetime"] = pd.to_datetime(df["match_datetime"])
     df = df.sort_values("match_datetime")
 
+    # Replay all Elo updates to get current ratings
+    elo = {}
+    for _, row in df.iterrows():
+        _update_elo(elo, row["home_team"], row["away_team"],
+                    int(row["home_goals"]), int(row["away_goals"]))
+
+    h_elo = elo.get(home_team, ELO_DEFAULT)
+    a_elo = elo.get(away_team, ELO_DEFAULT)
+
     fake_row = {
         "home_team": home_team,
         "away_team": away_team,
@@ -65,14 +88,63 @@ def compute_prediction_features(
         "season": df["season"].max() if len(df) else 2025,
         "matchday": 99,
     }
-    return _compute_features(fake_row, df)
+    return _compute_features(fake_row, df, h_elo=h_elo, a_elo=a_elo)
+
+
+# ---------------------------------------------------------------------------
+# Elo helpers
+# ---------------------------------------------------------------------------
+
+def _compute_elo_ratings(df: pd.DataFrame) -> dict[str, float]:
+    """
+    Compute Elo ratings by replaying all matches in order.
+    Returns the ratings BEFORE the first match (all at default).
+    Updates are applied in-place as we iterate, so callers must call
+    _update_elo() after reading the pre-match Elo.
+    """
+    return {}  # Will be populated incrementally during build_feature_matrix
+
+
+def _update_elo(
+    elo: dict[str, float],
+    home_team: str,
+    away_team: str,
+    home_goals: int,
+    away_goals: int,
+) -> None:
+    """Update Elo ratings in-place after a match result."""
+    h = elo.get(home_team, ELO_DEFAULT)
+    a = elo.get(away_team, ELO_DEFAULT)
+
+    # Expected score with home advantage
+    h_exp = 1.0 / (1.0 + 10.0 ** ((a - h - ELO_HOME_ADVANTAGE) / 400.0))
+    a_exp = 1.0 - h_exp
+
+    # Actual outcome
+    if home_goals > away_goals:
+        h_score, a_score = 1.0, 0.0
+    elif home_goals == away_goals:
+        h_score, a_score = 0.5, 0.5
+    else:
+        h_score, a_score = 0.0, 1.0
+
+    # Goal margin multiplier (capped at 3 goals)
+    margin = 1.0 + 0.1 * min(abs(home_goals - away_goals), 3)
+
+    elo[home_team] = h + ELO_K * margin * (h_score - h_exp)
+    elo[away_team] = a + ELO_K * margin * (a_score - a_exp)
 
 
 # ---------------------------------------------------------------------------
 # Core feature computation
 # ---------------------------------------------------------------------------
 
-def _compute_features(row: dict | pd.Series, prior: pd.DataFrame) -> dict:
+def _compute_features(
+    row: dict | pd.Series,
+    prior: pd.DataFrame,
+    h_elo: float = ELO_DEFAULT,
+    a_elo: float = ELO_DEFAULT,
+) -> dict:
     home = row["home_team"]
     away = row["away_team"]
     dt = row["match_datetime"]
@@ -80,9 +152,24 @@ def _compute_features(row: dict | pd.Series, prior: pd.DataFrame) -> dict:
 
     f = {}
 
+    # --- Elo ratings ---
+    f["h_elo"] = h_elo
+    f["a_elo"] = a_elo
+    f["elo_diff"] = h_elo - a_elo  # positive = home stronger
+
     # --- Form features ---
-    f.update(_form_features(home, prior, "home", prefix="h_"))
-    f.update(_form_features(away, prior, "away", prefix="a_"))
+    f.update(_form_features(home, prior, prefix="h_", window=FORM_WINDOW))
+    f.update(_form_features(away, prior, prefix="a_", window=FORM_WINDOW))
+
+    # --- Short-term momentum (last 3) ---
+    f.update(_form_features(home, prior, prefix="h_short_", window=FORM_SHORT))
+    f.update(_form_features(away, prior, prefix="a_short_", window=FORM_SHORT))
+
+    # --- Long-term form (last 10) ---
+    h_long = _form_pts_only(home, prior, window=FORM_LONG)
+    a_long = _form_pts_only(away, prior, window=FORM_LONG)
+    f["h_long_form_pts"] = h_long
+    f["a_long_form_pts"] = a_long
 
     # --- Home/away specific form ---
     f.update(_venue_form(home, prior, venue="home", prefix="h_home_"))
@@ -101,18 +188,28 @@ def _compute_features(row: dict | pd.Series, prior: pd.DataFrame) -> dict:
     # --- Match context ---
     f.update(_match_context(home, away, prior, dt))
 
+    # --- Differential features (explicit relative strength) ---
+    f["form_pts_diff"] = f["h_form_pts"] - f["a_form_pts"]
+    f["season_pts_pg_diff"] = f["h_season_pts_pg"] - f["a_season_pts_pg"]
+    f["season_gd_diff"] = (f["h_season_gf_pg"] - f["h_season_ga_pg"]) - (f["a_season_gf_pg"] - f["a_season_ga_pg"])
+    f["home_away_pts_diff"] = f["h_home_pts"] - f["a_away_pts"]
+    f["short_form_diff"] = f["h_short_form_pts"] - f["a_short_form_pts"]
+
     return f
 
 
-def _form_features(team: str, prior: pd.DataFrame, venue: str, prefix: str) -> dict:
-    """Rolling form over last FORM_WINDOW matches regardless of venue."""
+def _form_features(team: str, prior: pd.DataFrame, prefix: str, window: int) -> dict:
+    """Rolling form over last `window` matches regardless of venue."""
     team_matches = prior[
         (prior["home_team"] == team) | (prior["away_team"] == team)
-    ].tail(FORM_WINDOW)
+    ].tail(window)
 
     if len(team_matches) == 0:
-        return {f"{prefix}form_pts": 1.0, f"{prefix}form_gf": 1.3, f"{prefix}form_ga": 1.3,
-                f"{prefix}form_gd": 0.0, f"{prefix}win_streak": 0, f"{prefix}unbeaten": 0}
+        return {
+            f"{prefix}form_pts": 1.0, f"{prefix}form_gf": 1.3,
+            f"{prefix}form_ga": 1.3, f"{prefix}form_gd": 0.0,
+            f"{prefix}win_streak": 0, f"{prefix}unbeaten": 0,
+        }
 
     pts, gf, ga = [], [], []
     for _, m in team_matches.iterrows():
@@ -153,6 +250,25 @@ def _form_features(team: str, prior: pd.DataFrame, venue: str, prefix: str) -> d
     }
 
 
+def _form_pts_only(team: str, prior: pd.DataFrame, window: int) -> float:
+    """Average points over last `window` matches."""
+    team_matches = prior[
+        (prior["home_team"] == team) | (prior["away_team"] == team)
+    ].tail(window)
+
+    if len(team_matches) == 0:
+        return 1.0
+
+    pts = []
+    for _, m in team_matches.iterrows():
+        is_home = m["home_team"] == team
+        gf = m["home_goals"] if is_home else m["away_goals"]
+        ga = m["away_goals"] if is_home else m["home_goals"]
+        pts.append(3 if gf > ga else (1 if gf == ga else 0))
+
+    return float(np.mean(pts))
+
+
 def _venue_form(team: str, prior: pd.DataFrame, venue: str, prefix: str) -> dict:
     """Form only at home / only away over last FORM_WINDOW such matches."""
     if venue == "home":
@@ -185,8 +301,10 @@ def _season_stats(team: str, prior: pd.DataFrame, season: int, prefix: str) -> d
     ]
 
     if len(season_matches) == 0:
-        return {f"{prefix}season_pts_pg": 1.0, f"{prefix}season_gf_pg": 1.3,
-                f"{prefix}season_ga_pg": 1.3, f"{prefix}season_matches": 0}
+        return {
+            f"{prefix}season_pts_pg": 1.0, f"{prefix}season_gf_pg": 1.3,
+            f"{prefix}season_ga_pg": 1.3, f"{prefix}season_matches": 0,
+        }
 
     pts, gf, ga = [], [], []
     for _, m in season_matches.iterrows():
@@ -214,8 +332,10 @@ def _head_to_head(home: str, away: str, prior: pd.DataFrame) -> dict:
     ].tail(H2H_WINDOW)
 
     if len(h2h) == 0:
-        return {"h2h_home_wins": 0.33, "h2h_draws": 0.33, "h2h_away_wins": 0.33,
-                "h2h_home_gf": 1.3, "h2h_away_gf": 1.3, "h2h_matches": 0}
+        return {
+            "h2h_home_wins": 0.33, "h2h_draws": 0.33, "h2h_away_wins": 0.33,
+            "h2h_home_gf": 1.3, "h2h_away_gf": 1.3, "h2h_matches": 0,
+        }
 
     home_wins, draws, away_wins = 0, 0, 0
     home_gf, away_gf = [], []

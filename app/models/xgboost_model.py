@@ -20,15 +20,33 @@ MODEL_FILE = ARTIFACTS_DIR / "xgboost_model.pkl"
 
 # Features used by XGBoost (must match builder.py output)
 FEATURE_COLS = [
+    # Elo ratings (strongest signal)
+    "h_elo", "a_elo", "elo_diff",
+    # Recent form (5 matches)
     "h_form_pts", "h_form_gf", "h_form_ga", "h_form_gd", "h_win_streak", "h_unbeaten",
     "a_form_pts", "a_form_gf", "a_form_ga", "a_form_gd", "a_win_streak", "a_unbeaten",
+    # Short-term momentum (3 matches)
+    "h_short_form_pts", "h_short_form_gf", "h_short_form_ga", "h_short_form_gd",
+    "h_short_win_streak", "h_short_unbeaten",
+    "a_short_form_pts", "a_short_form_gf", "a_short_form_ga", "a_short_form_gd",
+    "a_short_win_streak", "a_short_unbeaten",
+    # Long-term form (10 matches)
+    "h_long_form_pts", "a_long_form_pts",
+    # Venue-specific form
     "h_home_pts", "h_home_gf", "h_home_ga",
     "a_away_pts", "a_away_gf", "a_away_ga",
+    # Season stats
     "h_season_pts_pg", "h_season_gf_pg", "h_season_ga_pg", "h_season_matches",
     "a_season_pts_pg", "a_season_gf_pg", "a_season_ga_pg", "a_season_matches",
+    # Head-to-head
     "h2h_home_wins", "h2h_draws", "h2h_away_wins", "h2h_home_gf", "h2h_away_gf", "h2h_matches",
+    # Table position
     "h_position", "a_position", "position_diff",
+    # Rest / fatigue
     "h_days_rest", "a_days_rest", "rest_advantage",
+    # Explicit differential features
+    "form_pts_diff", "season_pts_pg_diff", "season_gd_diff",
+    "home_away_pts_diff", "short_form_diff",
 ]
 
 
@@ -53,15 +71,16 @@ class XGBoostPredictor:
         tscv = TimeSeriesSplit(n_splits=5)
 
         base_model = XGBClassifier(
-            n_estimators=400,
+            n_estimators=600,
             max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=5,
-            gamma=0.1,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
+            learning_rate=0.03,        # slower learning → better generalisation
+            subsample=0.75,
+            colsample_bytree=0.7,
+            colsample_bylevel=0.7,     # additional column subsampling per level
+            min_child_weight=8,        # stricter leaf requirements → less overfitting
+            gamma=0.2,
+            reg_alpha=0.2,
+            reg_lambda=1.5,
             objective="multi:softprob",
             num_class=3,
             eval_metric="mlogloss",

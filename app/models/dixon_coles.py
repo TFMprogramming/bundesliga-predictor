@@ -59,7 +59,7 @@ def time_weight(match_dt: datetime, reference_dt: datetime, xi: float) -> float:
 # ---------------------------------------------------------------------------
 
 class DixonColesModel:
-    def __init__(self, xi: float = 0.003):
+    def __init__(self, xi: float = 0.006):  # half-life ~115 days (was 230)
         self.xi = xi
         self.teams: list[str] = []
         self.alpha: dict[str, float] = {}   # attack
