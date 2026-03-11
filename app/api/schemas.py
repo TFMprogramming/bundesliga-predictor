@@ -32,6 +32,12 @@ class MatchHighlight(BaseModel):
     text: str
 
 
+class TopScoreline(BaseModel):
+    home: int
+    away: int
+    probability: float
+
+
 class MatchPrediction(BaseModel):
     matchId: int
     matchDateTime: datetime | None
@@ -46,6 +52,7 @@ class MatchPrediction(BaseModel):
     dcProbabilities: Probabilities
     xgbProbabilities: Probabilities
     highlights: list[MatchHighlight] = []
+    topScorelines: list[TopScoreline] = []
 
 
 class NextMatchdayResponse(BaseModel):

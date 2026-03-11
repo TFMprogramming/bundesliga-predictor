@@ -165,6 +165,7 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
                 dcProbabilities=Probabilities(**dc_p),
                 xgbProbabilities=Probabilities(**xgb_p),
                 highlights=analyses.get(raw["matchId"]) or [],
+                topScorelines=result.get("topScorelines", []),
             )
         )
 

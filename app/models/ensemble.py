@@ -10,6 +10,49 @@ from pathlib import Path
 
 import numpy as np
 
+
+def _poisson_pmf(k: int, mu: float) -> float:
+    """Poisson PMF, stable for k ≤ 10 and mu ≤ 10."""
+    if mu < 1e-10:
+        return 1.0 if k == 0 else 0.0
+    try:
+        return math.exp(-mu) * (mu ** k) / math.factorial(k)
+    except (OverflowError, ValueError):
+        return 0.0
+
+
+def _calibrate_goals(mu: float, lam: float, target_hw: float, max_goals: int = 8) -> tuple[float, float]:
+    """
+    Adjust (mu, lam) so that P(home wins) matches target_hw,
+    while preserving total expected goals (mu + lam).
+    Uses binary search on the ratio r = mu/lam.
+    """
+    total = mu + lam
+    if total < 0.1 or not (0.05 < target_hw < 0.95):
+        return mu, lam
+
+    def hw_at_ratio(r: float) -> float:
+        m = total * r / (1.0 + r)
+        la = total / (1.0 + r)
+        hw = 0.0
+        for h in range(1, max_goals + 1):
+            ph = _poisson_pmf(h, m)
+            if ph < 1e-10:
+                continue
+            for a in range(h):
+                hw += ph * _poisson_pmf(a, la)
+        return hw
+
+    lo, hi = 0.05, 20.0
+    for _ in range(35):
+        mid = (lo + hi) / 2.0
+        if hw_at_ratio(mid) < target_hw:
+            lo = mid
+        else:
+            hi = mid
+    r_opt = (lo + hi) / 2.0
+    return total * r_opt / (1.0 + r_opt), total / (1.0 + r_opt)
+
 from app.models.dixon_coles import DixonColesModel
 from app.models.xgboost_model import XGBoostPredictor
 
@@ -146,15 +189,42 @@ class EnsemblePredictor:
         xgb_winner = max(xgb_probs, key=xgb_probs.get)
         agreement = dc_winner == xgb_winner
 
+        # --- Calibrated score prediction (aligned with ensemble probability) ---
+        try:
+            cal_mu, cal_lam = _calibrate_goals(mu, lam, blended["homeWin"])
+            size = max_goals + 1
+            cal_flat = [
+                _poisson_pmf(h, cal_mu) * _poisson_pmf(a, cal_lam)
+                for h in range(size) for a in range(size)
+            ]
+            total_p = sum(cal_flat) or 1.0
+            cal_flat = [p / total_p for p in cal_flat]
+
+            top_indices = sorted(range(len(cal_flat)), key=lambda i: cal_flat[i], reverse=True)[:5]
+            top_scorelines = [
+                {
+                    "home": i // size,
+                    "away": i % size,
+                    "probability": round(cal_flat[i], 4),
+                }
+                for i in top_indices
+            ]
+            best = top_indices[0]
+            predicted_score = {"home": best // size, "away": best % size}
+        except Exception:
+            top_scorelines = []
+            predicted_score = {"home": int(dc_score[0]), "away": int(dc_score[1])}
+
         return {
             "probabilities": {k: round(v, 4) for k, v in blended.items()},
-            "predictedScore": {"home": int(dc_score[0]), "away": int(dc_score[1])},
+            "predictedScore": predicted_score,
             "expectedGoals": {"home": round(mu, 2), "away": round(lam, 2)},
             "scoreMatrix": [[round(p, 5) for p in row] for row in score_matrix],
             "confidenceLevel": confidence,
             "modelAgreement": agreement,
             "dcProbabilities": {k: round(v, 4) for k, v in dc_probs.items()},
             "xgbProbabilities": {k: round(v, 4) for k, v in xgb_probs.items()},
+            "topScorelines": top_scorelines,
         }
 
 
