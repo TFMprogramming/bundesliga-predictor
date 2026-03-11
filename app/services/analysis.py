@@ -1,11 +1,11 @@
 from __future__ import annotations
 """
-Match analysis generator with deterministic variation.
-Uses match_id as seed → same match always gets same text,
-but each match picks from a large template pool based on its data.
+Match highlights generator — produces emoji bullet points per match.
+Each highlight surfaces a genuinely notable stat (good form, weak away record, etc.)
+Only shown if the value is actually remarkable, not for average situations.
 """
+import json
 import logging
-import random
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,270 +13,225 @@ from app.data.models import MatchAnalysis
 
 logger = logging.getLogger(__name__)
 
-
-def _rng(match_id: int, salt: int = 0) -> random.Random:
-    """Deterministic RNG seeded by match_id — reproducible per match."""
-    return random.Random(match_id * 31 + salt)
+# Stored as JSON in DB; prefix distinguishes from old plain-text format
+_JSON_PREFIX = "["
 
 
-def _pick(rng: random.Random, options: list[str]) -> str:
-    return rng.choice(options)
-
-
-def generate_analysis_text(
+def generate_highlights(
     home_team: str,
     away_team: str,
     prediction: dict,
     features: dict,
     dc_alpha: dict,
     dc_beta: dict,
-    match_id: int = 0,
-) -> str:
-    rng = _rng(match_id)
-
+) -> list[dict]:
+    """
+    Return a list of {emoji, text} dicts for the most notable match stats.
+    Only includes a highlight if the value is genuinely remarkable.
+    """
     probs = prediction["probabilities"]
-    score = prediction["predictedScore"]
     xg = prediction["expectedGoals"]
-    confidence = prediction.get("confidenceLevel", "medium")
-    model_agreement = prediction.get("modelAgreement", False)
-
-    elo_diff = features.get("elo_diff", 0)
-    h_form = features.get("h_form_pts", 1.0)
-    a_form = features.get("a_form_pts", 1.0)
-    h_short = features.get("h_short_form_pts", 1.0)
-    a_short = features.get("a_short_form_pts", 1.0)
-    h_home = features.get("h_home_pts", 1.0)
-    a_away = features.get("a_away_pts", 1.0)
-    h_pos = int(features.get("h_position", 9))
-    a_pos = int(features.get("a_position", 9))
-    h2h_h = features.get("h2h_home_wins", 0.33)
-    h2h_a = features.get("h2h_away_wins", 0.33)
-    h2h_n = int(features.get("h2h_matches", 0))
-    h_rest = int(features.get("h_days_rest", 7))
-    a_rest = int(features.get("a_days_rest", 7))
-    h_season = features.get("h_season_pts_pg", 1.0)
-    a_season = features.get("a_season_pts_pg", 1.0)
-    h_atk = dc_alpha.get(home_team, 1.0)
-    a_atk = dc_alpha.get(away_team, 1.0)
-    h_def = dc_beta.get(home_team, 1.0)
-    a_def = dc_beta.get(away_team, 1.0)
-
-    home_win = probs["homeWin"]
-    away_win = probs["awayWin"]
-    draw = probs["draw"]
-    is_home_fav = home_win > away_win and home_win > draw
-    is_away_fav = away_win > home_win and away_win > draw
-    is_draw_fav = draw >= home_win and draw >= away_win
-    fav = home_team if is_home_fav else (away_team if is_away_fav else None)
-    underdog = away_team if is_home_fav else (home_team if is_away_fav else None)
     xg_home, xg_away = xg["home"], xg["away"]
-    xg_diff = xg_home - xg_away
 
-    # Score all potential narrative angles by their "interestingness"
-    angles: list[tuple[float, str]] = []
+    elo_diff        = features.get("elo_diff", 0)
+    h_win_streak    = int(features.get("h_win_streak", 0))
+    a_win_streak    = int(features.get("a_win_streak", 0))
+    h_unbeaten      = int(features.get("h_unbeaten", 0))
+    a_unbeaten      = int(features.get("a_unbeaten", 0))
+    h_short_pts     = features.get("h_short_form_pts", 1.0)
+    a_short_pts     = features.get("a_short_form_pts", 1.0)
+    h_short_streak  = int(features.get("h_short_win_streak", 0))
+    a_short_streak  = int(features.get("a_short_win_streak", 0))
+    h_home_pts      = features.get("h_home_pts", 1.0)
+    a_away_pts      = features.get("a_away_pts", 1.0)
+    h_home_gf       = features.get("h_home_gf", 1.3)
+    h_home_ga       = features.get("h_home_ga", 1.3)
+    a_away_gf       = features.get("a_away_gf", 1.3)
+    a_away_ga       = features.get("a_away_ga", 1.3)
+    h2h_h           = features.get("h2h_home_wins", 0.33)
+    h2h_a           = features.get("h2h_away_wins", 0.33)
+    h2h_n           = int(features.get("h2h_matches", 0))
+    h_rest          = int(features.get("h_days_rest", 7))
+    a_rest          = int(features.get("a_days_rest", 7))
+    h_pos           = int(features.get("h_position", 9))
+    a_pos           = int(features.get("a_position", 9))
+    h_atk           = dc_alpha.get(home_team, 1.0)
+    a_atk           = dc_alpha.get(away_team, 1.0)
+    h_def           = dc_beta.get(home_team, 1.0)
+    a_def           = dc_beta.get(away_team, 1.0)
 
-    # ── Elo dominance ────────────────────────────────────────────────────────
-    if abs(elo_diff) >= 180:
+    # scored candidates: (score, emoji, text)
+    candidates: list[tuple[float, str, str]] = []
+
+    def add(score: float, emoji: str, text: str):
+        candidates.append((score, emoji, text))
+
+    # ── Win streaks ──────────────────────────────────────────────────────────
+    if h_win_streak >= 5:
+        add(h_win_streak, "🔥", f"{home_team}: {h_win_streak} Siege in Serie")
+    elif h_short_streak == 3:
+        add(3.0, "🔥", f"{home_team}: Letzte 3 Spiele alle gewonnen")
+    elif h_win_streak >= 3:
+        add(h_win_streak, "📈", f"{home_team}: {h_win_streak} Siege in Folge")
+
+    if a_win_streak >= 5:
+        add(a_win_streak, "🔥", f"{away_team}: {a_win_streak} Siege in Serie")
+    elif a_short_streak == 3:
+        add(3.0, "🔥", f"{away_team}: Letzte 3 Spiele alle gewonnen")
+    elif a_win_streak >= 3:
+        add(a_win_streak, "📈", f"{away_team}: {a_win_streak} Siege in Folge")
+
+    # ── Unbeaten streaks (only if no win streak already added) ───────────────
+    if h_unbeaten >= 5 and h_win_streak < 3:
+        add(h_unbeaten * 0.8, "🛡️", f"{home_team}: {h_unbeaten} Spiele ungeschlagen")
+    if a_unbeaten >= 5 and a_win_streak < 3:
+        add(a_unbeaten * 0.8, "🛡️", f"{away_team}: {a_unbeaten} Spiele ungeschlagen")
+
+    # ── Recent slump ─────────────────────────────────────────────────────────
+    if h_short_pts == 0.0:
+        add(2.5, "📉", f"{home_team}: 3 Spiele in Folge ohne Sieg")
+    elif h_short_pts <= 0.5 and h_win_streak == 0:
+        add(2.0, "📉", f"{home_team}: Schwache Kurzform ({h_short_pts:.1f} Pkt/Sp)")
+
+    if a_short_pts == 0.0:
+        add(2.5, "📉", f"{away_team}: 3 Spiele in Folge ohne Sieg")
+    elif a_short_pts <= 0.5 and a_win_streak == 0:
+        add(2.0, "📉", f"{away_team}: Schwache Kurzform ({a_short_pts:.1f} Pkt/Sp)")
+
+    # ── Home form ────────────────────────────────────────────────────────────
+    if h_home_pts >= 2.6:
+        add(h_home_pts, "🏠", f"{home_team} zuhause stark: {h_home_pts:.1f} Pkt/Sp")
+    elif h_home_pts <= 0.6:
+        add(2.5 - h_home_pts, "⚠️", f"{home_team} zuhause anfällig: {h_home_pts:.1f} Pkt/Sp")
+
+    if h_home_ga <= 0.6:
+        add(2.0, "🔒", f"{home_team}: Kaum Gegentore zuhause ({h_home_ga:.1f}/Sp)")
+    elif h_home_gf >= 2.5:
+        add(h_home_gf * 0.7, "⚽", f"{home_team}: Treffsicher zuhause ({h_home_gf:.1f} Tore/Sp)")
+
+    # ── Away form ────────────────────────────────────────────────────────────
+    if a_away_pts >= 2.0:
+        add(a_away_pts * 1.2, "✈️", f"{away_team} auswärts stark: {a_away_pts:.1f} Pkt/Sp")
+    elif a_away_pts <= 0.5:
+        add(2.5 - a_away_pts, "⚠️", f"{away_team} auswärts schwach: {a_away_pts:.1f} Pkt/Sp")
+
+    if a_away_gf >= 2.2:
+        add(a_away_gf * 0.6, "⚽", f"{away_team}: Treffsicher auswärts ({a_away_gf:.1f} Tore/Sp)")
+    elif a_away_ga <= 0.6:
+        add(1.8, "🔒", f"{away_team}: Wenig Gegentore auswärts ({a_away_ga:.1f}/Sp)")
+
+    # ── xG highlights ────────────────────────────────────────────────────────
+    if xg_home >= 2.2:
+        add(xg_home * 0.8, "⚽", f"{home_team}: {xg_home:.2f} xG erwartet – offensiv dominant")
+    if xg_away <= 0.7:
+        add(1.5, "🔒", f"{away_team}: Nur {xg_away:.2f} xG – kaum Chancen erwartet")
+    elif xg_away >= 2.0:
+        add(xg_away * 0.8, "⚽", f"{away_team}: {xg_away:.2f} xG – gefährlich für die Abwehr")
+
+    # ── H2H dominance ────────────────────────────────────────────────────────
+    if h2h_n >= 5 and h2h_h >= 0.6:
+        add((h2h_h - 0.33) * 4, "📊",
+            f"Direktvergleich: {home_team} gewinnt {h2h_h*100:.0f}% der letzten {h2h_n} Duelle")
+    elif h2h_n >= 5 and h2h_a >= 0.6:
+        add((h2h_a - 0.33) * 4, "📊",
+            f"Direktvergleich: {away_team} gewinnt {h2h_a*100:.0f}% der letzten {h2h_n} Duelle")
+
+    # ── Elo gap ──────────────────────────────────────────────────────────────
+    if abs(elo_diff) >= 200:
         stronger = home_team if elo_diff > 0 else away_team
-        weaker = away_team if elo_diff > 0 else home_team
-        diff = abs(int(elo_diff))
-        s = _pick(rng, [
-            f"{stronger} ist laut Elo-Modell um {diff} Punkte stärker als {weaker} – ein Unterschied, der sich selten nicht im Ergebnis niederschlägt.",
-            f"Mit einem Elo-Vorsprung von {diff} Punkten ist {stronger} in einer anderen Leistungsklasse als {weaker} an diesem Spieltag.",
-            f"Der KI-Stärkeindex stuft {stronger} ({int(features.get('h_elo' if elo_diff > 0 else 'a_elo', 1500))}) deutlich über {weaker} ({int(features.get('a_elo' if elo_diff > 0 else 'h_elo', 1500))}) ein.",
-        ])
-        angles.append((abs(elo_diff) / 50, s))
-    elif abs(elo_diff) >= 80:
-        stronger = home_team if elo_diff > 0 else away_team
-        diff = abs(int(elo_diff))
-        s = _pick(rng, [
-            f"{stronger} hat einen spürbaren Elo-Vorteil von {diff} Punkten – nicht überwältigend, aber konsistent genug, um den Ausschlag zu geben.",
-            f"Im Stärke-Rating liegt {stronger} mit {diff} Punkten Vorsprung vorn, was sich über eine Saison als verlässlicher Indikator erwiesen hat.",
-        ])
-        angles.append((abs(elo_diff) / 80, s))
+        add(abs(elo_diff) / 80, "💪",
+            f"{stronger} klar favorisiert: Elo-Vorsprung von {abs(int(elo_diff))} Punkten")
 
-    # ── Table position ───────────────────────────────────────────────────────
-    if abs(h_pos - a_pos) >= 10:
+    # ── Table gap ────────────────────────────────────────────────────────────
+    pos_diff = abs(h_pos - a_pos)
+    if pos_diff >= 12:
         higher = home_team if h_pos < a_pos else away_team
         lower = away_team if h_pos < a_pos else home_team
-        hp = h_pos if h_pos < a_pos else a_pos
-        lp = a_pos if h_pos < a_pos else h_pos
-        s = _pick(rng, [
-            f"Platz {hp} trifft auf Platz {lp} – der Tabellenabstand von {lp - hp} Rängen ist in der Bundesliga eine erhebliche Lücke.",
-            f"Zwischen {higher} (Platz {hp}) und {lower} (Platz {lp}) liegen {lp - hp} Tabellenplätze, was die unterschiedliche Saisonkonstanz unterstreicht.",
-        ])
-        angles.append((abs(h_pos - a_pos) / 5, s))
-
-    # ── Recent momentum (last 3) ─────────────────────────────────────────────
-    short_diff = h_short - a_short
-    if abs(short_diff) >= 1.2:
-        in_form = home_team if short_diff > 0 else away_team
-        out_form = away_team if short_diff > 0 else home_team
-        in_pts = h_short if short_diff > 0 else a_short
-        out_pts = a_short if short_diff > 0 else h_short
-        s = _pick(rng, [
-            f"{in_form} zeigt gerade Topform: {in_pts:.1f} Punkte pro Spiel in den letzten drei Partien, während {out_form} auf nur {out_pts:.1f} kommt.",
-            f"Der Trendunterschied ist markant – {in_form} holte zuletzt {in_pts:.1f} Pkt/Sp, {out_form} enttäuschte mit {out_pts:.1f}.",
-            f"Aktuell hat {in_form} Rückenwind: In der Kurzform (letzte 3) liegt der Abstand zu {out_form} bei {abs(short_diff):.1f} Punkten pro Spiel.",
-        ])
-        angles.append((abs(short_diff) * 1.2, s))
-    elif abs(short_diff) >= 0.7:
-        in_form = home_team if short_diff > 0 else away_team
-        in_pts = h_short if short_diff > 0 else a_short
-        s = _pick(rng, [
-            f"Kurzfristig hat {in_form} die bessere Form – {in_pts:.1f} Punkte pro Spiel in den letzten drei Partien.",
-        ])
-        angles.append((abs(short_diff), s))
-
-    # ── 5-match form ─────────────────────────────────────────────────────────
-    form_diff = h_form - a_form
-    if abs(form_diff) >= 0.8:
-        better = home_team if form_diff > 0 else away_team
-        worse = away_team if form_diff > 0 else home_team
-        b_pts = h_form if form_diff > 0 else a_form
-        w_pts = a_form if form_diff > 0 else h_form
-        s = _pick(rng, [
-            f"Die Formkurve über die letzten fünf Spiele zeigt: {better} mit {b_pts:.1f} Punkten pro Spiel ist derzeit einfach beständiger als {worse} ({w_pts:.1f}).",
-            f"{better} hat die deutlich bessere Fünf-Spiele-Form im Gepäck ({b_pts:.1f} vs. {w_pts:.1f} Pkt/Sp).",
-        ])
-        angles.append((abs(form_diff) * 0.9, s))
-
-    # ── Venue-specific form ──────────────────────────────────────────────────
-    venue_diff = h_home - a_away
-    if abs(venue_diff) >= 0.8:
-        if venue_diff > 0:
-            s = _pick(rng, [
-                f"{home_team} ist auf eigenem Platz schwer zu schlagen ({h_home:.1f} Pkt/Sp zuhause), {away_team} tut sich auswärts dagegen schwer ({a_away:.1f}).",
-                f"Die Heimbilanz von {home_team} ({h_home:.1f} Pkt/Sp) trifft auf die schwache Auswärtsbilanz von {away_team} ({a_away:.1f}) – ein klares strukturelles Ungleichgewicht.",
-            ])
-        else:
-            s = _pick(rng, [
-                f"{away_team} reist als starkes Auswärtsteam an ({a_away:.1f} Pkt/Sp), während {home_team} zuhause zuletzt enttäuschte ({h_home:.1f}).",
-                f"Interessante Konstellation: {away_team} ist auswärts ({a_away:.1f} Pkt/Sp) tatsächlich stärker als {home_team} auf eigenem Platz ({h_home:.1f}).",
-            ])
-        angles.append((abs(venue_diff) * 0.85, s))
-
-    # ── Head-to-head ─────────────────────────────────────────────────────────
-    if h2h_n >= 5 and max(h2h_h, h2h_a) >= 0.55:
-        dominant = home_team if h2h_h > h2h_a else away_team
-        rate = max(h2h_h, h2h_a)
-        s = _pick(rng, [
-            f"Die Geschichte dieses Duells spricht für {dominant}: {rate*100:.0f}% der letzten {h2h_n} Begegnungen gingen an sie.",
-            f"Im direkten Vergleich dominiert {dominant} mit {rate*100:.0f}% Siegen aus {h2h_n} Duellen.",
-            f"Historisch hat {dominant} in diesem Matchup eindeutig die Nase vorn – {rate*100:.0f}% Gewinnquote aus {h2h_n} Spielen.",
-        ])
-        angles.append((rate - 0.33, s))
-
-    # ── xG / attacking model ─────────────────────────────────────────────────
-    if abs(xg_diff) >= 0.8:
-        more = home_team if xg_diff > 0 else away_team
-        less = away_team if xg_diff > 0 else home_team
-        more_xg = xg_home if xg_diff > 0 else xg_away
-        s = _pick(rng, [
-            f"Das Torchancen-Modell sieht {more} klar vorn: {more_xg:.2f} erwartete Tore gegen {less} – das prognostizierte Ergebnis {score['home']}:{score['away']} passt dazu.",
-            f"Mit {xg_home:.2f} xG für {home_team} und {xg_away:.2f} für {away_team} spiegelt das erwartete Ergebnis {score['home']}:{score['away']} die Chancenstruktur klar wider.",
-            f"Angriffsstärke {home_team}: {h_atk:.2f}, Defensivrating {away_team}: {a_def:.2f} – das ergibt {xg_home:.2f} erwartete Tore für die Heimseite.",
-        ])
-        angles.append((abs(xg_diff) * 0.7, s))
+        add(pos_diff / 4, "📋",
+            f"{pos_diff} Tabellenplätze trennen {higher} (#{min(h_pos, a_pos)}) und {lower} (#{max(h_pos, a_pos)})")
 
     # ── Rest / fatigue ───────────────────────────────────────────────────────
     rest_diff = h_rest - a_rest
-    if abs(rest_diff) >= 3:
-        fresher = home_team if rest_diff > 0 else away_team
-        tired = away_team if rest_diff > 0 else home_team
-        fresh_days = max(h_rest, a_rest)
-        tired_days = min(h_rest, a_rest)
-        s = _pick(rng, [
-            f"Konditionell hat {fresher} einen Vorteil: {fresh_days} Tage Pause gegenüber nur {tired_days} bei {tired}.",
-            f"{tired} kommt unter Umständen mit müden Beinen – nur {tired_days} Ruhetage, während {fresher} {fresh_days} Tage regenerieren konnte.",
-        ])
-        angles.append((abs(rest_diff) / 3, s))
+    if rest_diff <= -3:
+        add(abs(rest_diff) * 0.4, "😴",
+            f"Frischevorteil {away_team}: {a_rest} vs. {h_rest} Ruhetage")
+    elif rest_diff >= 3:
+        add(rest_diff * 0.4, "😴",
+            f"Frischevorteil {home_team}: {h_rest} vs. {a_rest} Ruhetage")
 
-    # ── Season consistency ───────────────────────────────────────────────────
-    if abs(h_season - a_season) >= 0.6:
-        better = home_team if h_season > a_season else away_team
-        worse = away_team if h_season > a_season else home_team
-        b_pts = max(h_season, a_season)
-        w_pts = min(h_season, a_season)
-        s = _pick(rng, [
-            f"Saisonal ist {better} mit {b_pts:.2f} Punkten pro Spiel das konstantere Team gegenüber {worse} ({w_pts:.2f}).",
-        ])
-        angles.append((abs(h_season - a_season) * 0.7, s))
+    # ── Model agreement ──────────────────────────────────────────────────────
+    if prediction.get("modelAgreement") and prediction.get("confidenceLevel") == "high":
+        add(1.2, "🤝", "Beide KI-Modelle kommen unabhängig zum gleichen Tipp")
 
-    # ── Close match / draw scenarios ─────────────────────────────────────────
-    if is_draw_fav or (not is_home_fav and not is_away_fav):
-        s = _pick(rng, [
-            f"Beide Teams sind so nah beieinander, dass das Modell ein Unentschieden als wahrscheinlichstes Einzelergebnis sieht – kleine Zufälligkeiten entscheiden hier.",
-            f"Die Kennzahlen ergeben ein klassisches Fifty-fifty-Duell: Weder Elo, Form noch Direktvergleich liefern ein klares Signal.",
-            f"Dieses Spiel ist für das Modell eine echte Gratwanderung – die Wahrscheinlichkeiten für alle drei Ausgänge liegen relativ eng beieinander.",
-        ])
-        angles.append((0.5, s))
+    # ── Select top highlights (max 5, diverse) ───────────────────────────────
+    candidates.sort(key=lambda x: x[0], reverse=True)
 
-    # ── Model agreement bonus sentence ──────────────────────────────────────
-    agreement_sentence = ""
-    if model_agreement and confidence == "high":
-        agreement_sentence = _pick(rng, [
-            f"Bemerkenswert: Beide KI-Modelle (Dixon-Coles und XGBoost) zeigen in die gleiche Richtung – das erhöht die Verlässlichkeit dieser Prognose.",
-            f"Alle Modelle sind sich einig, was in dieser Konstellation nicht selbstverständlich ist.",
-        ])
-    elif not model_agreement:
-        agreement_sentence = _pick(rng, [
-            f"Die beiden Teilmodelle kommen hier zu leicht unterschiedlichen Einschätzungen – das Ensemble-Ergebnis ist ein gewichteter Kompromiss.",
-        ])
+    # Avoid showing two highlights about the same team's same aspect
+    seen_teams: dict[str, int] = {}
+    result = []
+    for _, emoji, text in candidates:
+        # Count how many times this team already appears
+        team_in_text = home_team if home_team in text else (away_team if away_team in text else None)
+        if team_in_text:
+            if seen_teams.get(team_in_text, 0) >= 2:
+                continue
+            seen_teams[team_in_text] = seen_teams.get(team_in_text, 0) + 1
+        result.append({"emoji": emoji, "text": text})
+        if len(result) >= 5:
+            break
 
-    # ── Select the best angles ───────────────────────────────────────────────
-    angles.sort(key=lambda x: x[0], reverse=True)
-
-    # Vary number of core sentences (2 or 3) based on match_id
-    n_main = rng.choice([2, 2, 3])
-    selected = [text for _, text in angles[:n_main]]
-
-    if not selected:
-        # Fallback for very average matches
-        selected = [_pick(rng, [
-            f"Das Modell sieht {fav or home_team} leicht vorn – die Unterschiede in den Kennzahlen sind vorhanden, aber nicht dramatisch.",
-            f"Ein schwer einschätzbares Spiel: Die meisten Kennzahlen zeigen keine klare Dominanz einer Seite.",
-        ])]
-
-    if agreement_sentence:
-        selected.append(agreement_sentence)
-
-    return " ".join(selected)
+    return result
 
 
 async def generate_all_analyses(
     matches_data: list[dict],
     matchday: int,
     session: AsyncSession,
-) -> dict[int, str]:
-    """Return analyses for all matches. DB-cached, generated locally."""
+) -> dict[int, list[dict]]:
+    """Return highlights for all matches. DB-cached, generated locally (free)."""
     match_ids = [m["match_id"] for m in matches_data]
 
     result = await session.execute(
         select(MatchAnalysis).where(MatchAnalysis.match_id.in_(match_ids))
     )
-    cached = {row.match_id: row.analysis_text for row in result.scalars().all()}
+    # Only use cached entries that are JSON (new format)
+    cached: dict[int, list[dict]] = {}
+    for row in result.scalars().all():
+        if row.analysis_text.startswith(_JSON_PREFIX):
+            try:
+                parsed = json.loads(row.analysis_text)
+                if parsed:  # skip empty cached arrays — regenerate them
+                    cached[row.match_id] = parsed
+            except Exception:
+                pass
 
     missing = [m for m in matches_data if m["match_id"] not in cached]
     if not missing:
         return cached
 
-    logger.info(f"Generating analysis for {len(missing)} matches (matchday {matchday})")
+    logger.info(f"Generating highlights for {len(missing)} matches (matchday {matchday})")
 
     for m in missing:
-        text = generate_analysis_text(
+        highlights = generate_highlights(
             m["home_team"], m["away_team"],
             m["prediction"], m["features"],
             m["dc_alpha"], m["dc_beta"],
-            match_id=m["match_id"],
         )
-        if text:
+        json_str = json.dumps(highlights, ensure_ascii=False)
+        # Upsert
+        existing = await session.execute(
+            select(MatchAnalysis).where(MatchAnalysis.match_id == m["match_id"])
+        )
+        row = existing.scalar_one_or_none()
+        if row:
+            row.analysis_text = json_str
+        else:
             session.add(MatchAnalysis(
                 match_id=m["match_id"],
                 matchday=matchday,
-                analysis_text=text,
+                analysis_text=json_str,
             ))
-            cached[m["match_id"]] = text
+        cached[m["match_id"]] = highlights
 
     await session.commit()
     return cached

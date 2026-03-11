@@ -27,6 +27,11 @@ class ExpectedGoals(BaseModel):
     away: float
 
 
+class MatchHighlight(BaseModel):
+    emoji: str
+    text: str
+
+
 class MatchPrediction(BaseModel):
     matchId: int
     matchDateTime: datetime | None
@@ -40,7 +45,7 @@ class MatchPrediction(BaseModel):
     modelAgreement: bool
     dcProbabilities: Probabilities
     xgbProbabilities: Probabilities
-    analysisText: str | None = None
+    highlights: list[MatchHighlight] = []
 
 
 class NextMatchdayResponse(BaseModel):

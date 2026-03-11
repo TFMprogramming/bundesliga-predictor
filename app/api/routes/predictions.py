@@ -164,7 +164,7 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
                 modelAgreement=result["modelAgreement"],
                 dcProbabilities=Probabilities(**dc_p),
                 xgbProbabilities=Probabilities(**xgb_p),
-                analysisText=analyses.get(raw["matchId"]) or None,
+                highlights=analyses.get(raw["matchId"]) or [],
             )
         )
 
