@@ -51,6 +51,7 @@ class MatchPrediction(BaseModel):
     modelAgreement: bool
     dcProbabilities: Probabilities
     xgbProbabilities: Probabilities
+    lgbmProbabilities: Probabilities | None = None
     highlights: list[MatchHighlight] = []
     topScorelines: list[TopScoreline] = []
 

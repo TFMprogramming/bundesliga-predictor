@@ -1,7 +1,7 @@
 from __future__ import annotations
 """
-Ensemble: combines Dixon-Coles (Poisson) + XGBoost predictions.
-Weights are optimised via cross-validation in optimize_weights().
+Ensemble: combines Dixon-Coles (Poisson) + XGBoost + LightGBM predictions.
+Weights are optimised via cross-validation using log-loss + Brier score.
 """
 import json
 import logging
@@ -53,76 +53,125 @@ def _calibrate_goals(mu: float, lam: float, target_hw: float, max_goals: int = 8
     r_opt = (lo + hi) / 2.0
     return total * r_opt / (1.0 + r_opt), total / (1.0 + r_opt)
 
+
 from app.models.dixon_coles import DixonColesModel
 from app.models.xgboost_model import XGBoostPredictor
+from app.models.lgbm_model import LGBMPredictor
 
 logger = logging.getLogger(__name__)
 
 ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
 WEIGHTS_FILE = ARTIFACTS_DIR / "ensemble_weights.json"
 
-# Defaults – overridden if weights file exists or optimize_weights() is called
-DC_WEIGHT = 0.40
-XGB_WEIGHT = 0.60
+# Defaults — overridden if weights file exists or optimize_weights() is called
+DC_WEIGHT_DEFAULT = 0.30
+XGB_WEIGHT_DEFAULT = 0.45
+LGBM_WEIGHT_DEFAULT = 0.25
 
 
-def _load_weights() -> tuple[float, float]:
+def _load_weights() -> tuple[float, float, float]:
     """Load saved ensemble weights, falling back to defaults."""
     if WEIGHTS_FILE.exists():
         data = json.loads(WEIGHTS_FILE.read_text())
-        return float(data["dc_weight"]), float(data["xgb_weight"])
-    return DC_WEIGHT, XGB_WEIGHT
+        dc_w = float(data.get("dc_weight", DC_WEIGHT_DEFAULT))
+        xgb_w = float(data.get("xgb_weight", XGB_WEIGHT_DEFAULT))
+        lgbm_w = float(data.get("lgbm_weight", LGBM_WEIGHT_DEFAULT))
+        # Renormalise in case of old 2-model weight file (lgbm_weight missing)
+        total = dc_w + xgb_w + lgbm_w
+        return dc_w / total, xgb_w / total, lgbm_w / total
+    return DC_WEIGHT_DEFAULT, XGB_WEIGHT_DEFAULT, LGBM_WEIGHT_DEFAULT
 
 
 def optimize_weights(
     dc_probs_list: list[dict],
     xgb_probs_list: list[dict],
+    lgbm_probs_list: list[dict] | None,
     outcomes: list[int],
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """
-    Find the DC/XGB blend weight that minimises log-loss on held-out predictions.
+    Find the DC/XGB/LGBM blend weights that minimise a combined
+    log-loss + Brier score objective on held-out predictions.
 
-    dc_probs_list / xgb_probs_list: list of {homeWin, draw, awayWin} dicts
-    outcomes: list of ints (0=home win, 1=draw, 2=away win)
-
-    Returns (dc_weight, xgb_weight) and saves to disk.
+    Returns (dc_weight, xgb_weight, lgbm_weight) and saves to disk.
     """
-    from scipy.optimize import minimize_scalar
+    from scipy.optimize import minimize
 
     keys = ["homeWin", "draw", "awayWin"]
-
     dc_arr = np.array([[p[k] for k in keys] for p in dc_probs_list])
     xgb_arr = np.array([[p[k] for k in keys] for p in xgb_probs_list])
     y = np.array(outcomes)
 
-    def log_loss(alpha: float) -> float:
-        blended = alpha * dc_arr + (1 - alpha) * xgb_arr
-        # Normalise rows
-        blended = blended / blended.sum(axis=1, keepdims=True)
-        # Clip to avoid log(0)
-        blended = np.clip(blended, 1e-10, 1.0)
+    has_lgbm = lgbm_probs_list is not None and len(lgbm_probs_list) == len(outcomes)
+    lgbm_arr = np.array([[p[k] for k in keys] for p in lgbm_probs_list]) if has_lgbm else None
+
+    def _blend(w_dc: float, w_xgb: float, w_lgbm: float) -> np.ndarray:
+        b = w_dc * dc_arr + w_xgb * xgb_arr
+        if has_lgbm and lgbm_arr is not None:
+            b = b + w_lgbm * lgbm_arr
+        b = b / b.sum(axis=1, keepdims=True)
+        return np.clip(b, 1e-10, 1.0)
+
+    def objective(log_w: np.ndarray) -> float:
+        # Softmax parameterisation: weights always positive & sum to 1
+        w = np.exp(log_w - log_w.max())
+        w = w / w.sum()
+        blended = _blend(w[0], w[1], w[2])
+        # Log-loss
         ll = -np.mean(np.log(blended[np.arange(len(y)), y]))
-        return ll
+        # Brier score (home win as reference class, generalised)
+        brier = float(np.mean(np.sum((blended - np.eye(3)[y]) ** 2, axis=1)))
+        return 0.7 * ll + 0.3 * brier  # combined objective
 
-    result = minimize_scalar(log_loss, bounds=(0.0, 1.0), method="bounded")
-    best_alpha = float(result.x)
-    dc_w = round(best_alpha, 3)
-    xgb_w = round(1.0 - dc_w, 3)
+    n_models = 3 if has_lgbm else 2
+    x0 = np.zeros(n_models)  # softmax([0,0,0]) = [1/3, 1/3, 1/3]
+    if n_models == 2:
+        # Pad to 3 dims but fix lgbm to near-zero
+        x0 = np.array([0.0, 0.0, -10.0])
 
-    logger.info(f"Optimised ensemble weights: DC={dc_w:.3f}, XGB={xgb_w:.3f} (log-loss={result.fun:.4f})")
+    result = minimize(objective, x0, method="Nelder-Mead",
+                      options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-6})
+
+    w_opt = np.exp(result.x - result.x.max())
+    w_opt = w_opt / w_opt.sum()
+    dc_w = round(float(w_opt[0]), 3)
+    xgb_w = round(float(w_opt[1]), 3)
+    lgbm_w = round(float(w_opt[2]), 3)
+
+    logger.info(
+        f"Optimised ensemble weights: DC={dc_w:.3f}, XGB={xgb_w:.3f}, "
+        f"LGBM={lgbm_w:.3f} (objective={result.fun:.4f})"
+    )
 
     ARTIFACTS_DIR.mkdir(exist_ok=True)
-    WEIGHTS_FILE.write_text(json.dumps({"dc_weight": dc_w, "xgb_weight": xgb_w}, indent=2))
+    WEIGHTS_FILE.write_text(json.dumps(
+        {"dc_weight": dc_w, "xgb_weight": xgb_w, "lgbm_weight": lgbm_w}, indent=2
+    ))
 
-    return dc_w, xgb_w
+    return dc_w, xgb_w, lgbm_w
 
 
 class EnsemblePredictor:
-    def __init__(self, dc_model: DixonColesModel, xgb_model: XGBoostPredictor):
+    def __init__(
+        self,
+        dc_model: DixonColesModel,
+        xgb_model: XGBoostPredictor,
+        lgbm_model: LGBMPredictor | None = None,
+    ):
         self.dc = dc_model
         self.xgb = xgb_model
-        self.dc_weight, self.xgb_weight = _load_weights()
-        logger.info(f"Ensemble weights: DC={self.dc_weight:.2f}, XGB={self.xgb_weight:.2f}")
+        self.lgbm = lgbm_model
+        self.dc_weight, self.xgb_weight, self.lgbm_weight = _load_weights()
+        if lgbm_model is None:
+            # Redistribute LGBM weight to XGB if LGBM not available
+            total = self.dc_weight + self.xgb_weight
+            if total > 0:
+                self.dc_weight /= total
+                self.xgb_weight /= total
+            self.lgbm_weight = 0.0
+        logger.info(
+            f"Ensemble weights: DC={self.dc_weight:.2f}, "
+            f"XGB={self.xgb_weight:.2f}, LGBM={self.lgbm_weight:.2f}"
+        )
 
     def predict(
         self,
@@ -143,6 +192,7 @@ class EnsemblePredictor:
             modelAgreement: bool
             dcProbabilities: raw Dixon-Coles probs
             xgbProbabilities: raw XGBoost probs
+            lgbmProbabilities: raw LightGBM probs (or same as XGB if unavailable)
         """
         # --- Dixon-Coles ---
         dc_probs = self.dc.predict_1x2(home_team, away_team)
@@ -153,19 +203,45 @@ class EnsemblePredictor:
         # --- XGBoost ---
         try:
             xgb_probs = self.xgb.predict_proba(features)
-            xgb_weight = self.xgb_weight
-            dc_weight = self.dc_weight
         except Exception as e:
-            logger.warning(f"XGBoost prediction failed, using DC only: {e}")
-            xgb_probs = dc_probs
-            xgb_weight = 0.0
-            dc_weight = 1.0
+            logger.warning(f"XGBoost prediction failed: {e}")
+            xgb_probs = None
+
+        # --- LightGBM ---
+        lgbm_probs = None
+        if self.lgbm is not None and self.lgbm_weight > 0:
+            try:
+                lgbm_probs = self.lgbm.predict_proba(features)
+            except Exception as e:
+                logger.warning(f"LightGBM prediction failed: {e}")
 
         # --- Ensemble blend ---
+        # Determine effective weights based on model availability
+        dc_w = self.dc_weight
+        xgb_w = self.xgb_weight if xgb_probs is not None else 0.0
+        lgbm_w = self.lgbm_weight if lgbm_probs is not None else 0.0
+
+        if xgb_probs is None and lgbm_probs is None:
+            xgb_probs = dc_probs
+            lgbm_probs = dc_probs
+            dc_w, xgb_w, lgbm_w = 1.0, 0.0, 0.0
+        elif xgb_probs is None:
+            xgb_probs = lgbm_probs
+            dc_w += xgb_w
+            xgb_w = 0.0
+        elif lgbm_probs is None:
+            lgbm_probs = xgb_probs
+            dc_w += lgbm_w
+            lgbm_w = 0.0
+
+        total_w = dc_w + xgb_w + lgbm_w
+        if total_w < 1e-10:
+            dc_w, total_w = 1.0, 1.0
+
+        keys = ["homeWin", "draw", "awayWin"]
         blended = {
-            "homeWin": dc_weight * dc_probs["homeWin"] + xgb_weight * xgb_probs["homeWin"],
-            "draw":    dc_weight * dc_probs["draw"]    + xgb_weight * xgb_probs["draw"],
-            "awayWin": dc_weight * dc_probs["awayWin"] + xgb_weight * xgb_probs["awayWin"],
+            k: (dc_w * dc_probs[k] + xgb_w * xgb_probs[k] + lgbm_w * lgbm_probs[k]) / total_w
+            for k in keys
         }
         # Renormalise
         total = sum(blended.values())
@@ -184,10 +260,11 @@ class EnsemblePredictor:
         else:
             confidence = "low"
 
-        # --- Model agreement (both predict same winner) ---
-        dc_winner = max(dc_probs, key=dc_probs.get)
-        xgb_winner = max(xgb_probs, key=xgb_probs.get)
-        agreement = dc_winner == xgb_winner
+        # --- Model agreement (DC, XGB and LGBM all agree on winner) ---
+        winners = [max(dc_probs, key=dc_probs.get), max(xgb_probs, key=xgb_probs.get)]
+        if lgbm_probs is not None:
+            winners.append(max(lgbm_probs, key=lgbm_probs.get))
+        agreement = len(set(winners)) == 1
 
         # --- Calibrated score prediction (aligned with ensemble probability) ---
         try:
@@ -224,6 +301,7 @@ class EnsemblePredictor:
             "modelAgreement": agreement,
             "dcProbabilities": {k: round(v, 4) for k, v in dc_probs.items()},
             "xgbProbabilities": {k: round(v, 4) for k, v in xgb_probs.items()},
+            "lgbmProbabilities": {k: round(v, 4) for k, v in (lgbm_probs or xgb_probs).items()},
             "topScorelines": top_scorelines,
         }
 
@@ -231,4 +309,9 @@ class EnsemblePredictor:
 def load_ensemble() -> EnsemblePredictor:
     dc = DixonColesModel.load()
     xgb = XGBoostPredictor.load()
-    return EnsemblePredictor(dc, xgb)
+    try:
+        lgbm = LGBMPredictor.load()
+    except (FileNotFoundError, Exception) as e:
+        logger.info(f"LightGBM model not available, using DC+XGB only: {e}")
+        lgbm = None
+    return EnsemblePredictor(dc, xgb, lgbm)

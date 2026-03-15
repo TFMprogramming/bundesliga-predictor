@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
 MODEL_FILE = ARTIFACTS_DIR / "xgboost_model.pkl"
 
-# Features used by XGBoost (must match builder.py output)
+# Features used by XGBoost / LightGBM (must match builder.py output)
 FEATURE_COLS = [
     # Elo ratings (strongest signal)
     "h_elo", "a_elo", "elo_diff",
@@ -47,6 +47,17 @@ FEATURE_COLS = [
     # Explicit differential features
     "form_pts_diff", "season_pts_pg_diff", "season_gd_diff",
     "home_away_pts_diff", "short_form_diff",
+    # Dixon-Coles model-derived team strength (time-decay-weighted attack/defense)
+    "h_dc_attack", "h_dc_defense", "a_dc_attack", "a_dc_defense",
+    "dc_mu", "dc_lam", "dc_mu_lam_ratio",
+    # Form trend: short vs. long momentum direction (improving / declining)
+    "h_form_trend", "a_form_trend", "form_trend_diff",
+    # Defensive consistency (clean sheet rate)
+    "h_clean_sheet_rate", "a_clean_sheet_rate",
+    # Scoring / conceding consistency (std dev)
+    "h_goals_var", "a_goals_var", "h_conceded_var", "a_conceded_var",
+    # Pythagorean win expectation (GF^1.83 / (GF^1.83 + GA^1.83))
+    "h_pythagorean", "a_pythagorean", "pythagorean_diff",
 ]
 
 
@@ -71,16 +82,16 @@ class XGBoostPredictor:
         tscv = TimeSeriesSplit(n_splits=5)
 
         base_model = XGBClassifier(
-            n_estimators=600,
+            n_estimators=700,
             max_depth=4,
-            learning_rate=0.03,        # slower learning → better generalisation
+            learning_rate=0.025,       # slower learning → better generalisation
             subsample=0.75,
-            colsample_bytree=0.7,
-            colsample_bylevel=0.7,     # additional column subsampling per level
-            min_child_weight=8,        # stricter leaf requirements → less overfitting
-            gamma=0.2,
-            reg_alpha=0.2,
-            reg_lambda=1.5,
+            colsample_bytree=0.65,
+            colsample_bylevel=0.65,    # additional column subsampling per level
+            min_child_weight=10,       # stricter leaf requirements → less overfitting
+            gamma=0.3,
+            reg_alpha=0.3,
+            reg_lambda=2.0,
             objective="multi:softprob",
             num_class=3,
             eval_metric="mlogloss",

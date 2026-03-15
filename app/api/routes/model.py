@@ -12,6 +12,7 @@ from app.data.models import ModelArtifact
 from app.models.dixon_coles import DixonColesModel
 from app.models.ensemble import EnsemblePredictor, optimize_weights
 from app.models.xgboost_model import XGBoostPredictor
+from app.models.lgbm_model import LGBMPredictor
 from app.features.builder import build_feature_matrix
 from sqlalchemy import select
 
@@ -58,13 +59,25 @@ async def _run_training(session: AsyncSession):
     dc.fit(matches, reference_dt=datetime.utcnow())
     dc.save()
 
-    # 2. Build feature matrix and fit XGBoost
-    feature_df = build_feature_matrix(matches)
+    # 2. Build feature matrix (pass dc_model for DC-derived features)
+    feature_df = build_feature_matrix(matches, dc_model=dc)
+
+    # 3. Fit XGBoost
     xgb = XGBoostPredictor()
     metrics = xgb.fit(feature_df)
     xgb.save()
 
-    # 3. Optimise ensemble weights on last 20% of matches (time-ordered)
+    # 4. Fit LightGBM
+    lgbm = LGBMPredictor()
+    try:
+        lgbm_metrics = lgbm.fit(feature_df)
+        lgbm.save()
+        logger.info(f"LGBM metrics: {lgbm_metrics}")
+    except Exception as e:
+        logger.warning(f"LightGBM training skipped: {e}")
+        lgbm = None
+
+    # 5. Optimise ensemble weights on last 20% of matches (time-ordered)
     try:
         val_df = feature_df.dropna(subset=xgb.feature_cols + ["outcome"])
         split = int(len(val_df) * 0.8)
@@ -72,17 +85,23 @@ async def _run_training(session: AsyncSession):
         val_matches = matches[int(len(matches) * 0.8):]  # same time slice
 
         if len(val_matches) >= 30:
-            dc_probs_list, xgb_probs_list, outcomes = [], [], []
+            dc_probs_list, xgb_probs_list, lgbm_probs_list, outcomes = [], [], [], []
             for m, (_, row) in zip(val_matches, val_df.iterrows()):
                 try:
                     feat = row[xgb.feature_cols].to_dict()
                     dc_probs_list.append(dc.predict_1x2(m["home_team"], m["away_team"]))
                     xgb_probs_list.append(xgb.predict_proba(feat))
+                    if lgbm is not None:
+                        lgbm_probs_list.append(lgbm.predict_proba(feat))
                     outcomes.append(int(row["outcome"]))
                 except Exception:
                     continue
             if len(outcomes) >= 30:
-                optimize_weights(dc_probs_list, xgb_probs_list, outcomes)
+                optimize_weights(
+                    dc_probs_list, xgb_probs_list,
+                    lgbm_probs_list if lgbm is not None and lgbm_probs_list else None,
+                    outcomes,
+                )
     except Exception as e:
         logger.warning(f"Weight optimisation skipped: {e}")
 

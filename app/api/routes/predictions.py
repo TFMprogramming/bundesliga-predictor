@@ -95,7 +95,7 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
         away_name = raw["awayTeamName"]
         match_dt = raw["matchDatetime"]
 
-        features = compute_prediction_features(home_name, away_name, all_matches, match_dt)
+        features = compute_prediction_features(home_name, away_name, all_matches, match_dt, dc_model=ensemble.dc)
         result = ensemble.predict(home_name, away_name, features)
 
         match_results.append({
@@ -149,6 +149,7 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
         p = result["probabilities"]
         dc_p = result["dcProbabilities"]
         xgb_p = result["xgbProbabilities"]
+        lgbm_p = result.get("lgbmProbabilities")
 
         predictions.append(
             MatchPrediction(
@@ -164,6 +165,7 @@ async def get_next_matchday_predictions(session: AsyncSession = Depends(get_db))
                 modelAgreement=result["modelAgreement"],
                 dcProbabilities=Probabilities(**dc_p),
                 xgbProbabilities=Probabilities(**xgb_p),
+                lgbmProbabilities=Probabilities(**lgbm_p) if lgbm_p else None,
                 highlights=analyses.get(raw["matchId"]) or [],
                 topScorelines=result.get("topScorelines", []),
             )

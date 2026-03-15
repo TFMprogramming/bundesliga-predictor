@@ -1,4 +1,5 @@
 {
-  "dc_weight": 0.489,
-  "xgb_weight": 0.511
+  "dc_weight": 0.233,
+  "xgb_weight": 0.767,
+  "lgbm_weight": 0.0
 }
